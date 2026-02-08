@@ -1,0 +1,7 @@
+Origin: milady-ai
+Label: Milaidy
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64 all
+Components: main
+Description: APT repository for Milaidy — personal AI assistant

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><title>Milaidy APT Repository</title></head>
+<body>
+<h1>Milaidy APT Repository</h1>
+<p>Personal AI assistant built on <a href="https://github.com/elizaos">ElizaOS</a>.</p>
+<h2>Quick Install</h2>
+<pre>
+curl -fsSL https://milady-ai.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/milaidy.gpg
+echo "deb [signed-by=/usr/share/keyrings/milaidy.gpg] https://milady-ai.github.io/apt stable main" | \
+  sudo tee /etc/apt/sources.list.d/milaidy.list
+sudo apt update
+sudo apt install milaidy
+</pre>
+</body>
+</html>
