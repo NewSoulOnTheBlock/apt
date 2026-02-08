@@ -1,0 +1,223 @@
+name: Update APT Repository
+
+on:
+  # Triggered by the main milaidy repo's publish-packages workflow
+  repository_dispatch:
+    types: [update-apt]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to package (e.g. 2.0.0-alpha.7)"
+        required: true
+      deb_url:
+        description: "URL to .deb file (optional — will build from source if not provided)"
+        required: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-publish:
+    name: Build .deb and Update Repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout apt repo
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Determine version
+        id: ver
+        run: |
+          VERSION="${{ github.event.client_payload.version || inputs.version }}"
+          DEB_URL="${{ github.event.client_payload.deb_url || inputs.deb_url }}"
+          DEB_VERSION=$(echo "$VERSION" | sed -E 's/-alpha\./~alpha/; s/-beta\./~beta/; s/-rc\./~rc/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "deb_version=${DEB_VERSION}-1" >> "$GITHUB_OUTPUT"
+          echo "deb_url=$DEB_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download or build .deb
+        run: |
+          mkdir -p pool/main/m/milaidy
+
+          if [[ -n "${{ steps.ver.outputs.deb_url }}" ]]; then
+            # Download pre-built .deb
+            curl -fsSL "${{ steps.ver.outputs.deb_url }}" -o pool/main/m/milaidy/milaidy_${{ steps.ver.outputs.deb_version }}_all.deb
+          else
+            # Build from npm package
+            VERSION="${{ steps.ver.outputs.version }}"
+            DEB_VERSION="${{ steps.ver.outputs.deb_version }}"
+
+            # Create a temporary build directory
+            BUILDDIR=$(mktemp -d)
+            cd "$BUILDDIR"
+
+            # Install milaidy from npm
+            npm pack "milaidy@${VERSION}" 2>/dev/null || npm pack milaidy
+            tar xzf milaidy-*.tgz
+            cd package
+
+            # Create a minimal .deb using dpkg-deb
+            PKGDIR="$BUILDDIR/milaidy_${DEB_VERSION}_all"
+            mkdir -p "$PKGDIR/DEBIAN"
+            mkdir -p "$PKGDIR/usr/lib/milaidy"
+            mkdir -p "$PKGDIR/usr/bin"
+
+            # Copy the package contents
+            cp -r dist/ "$PKGDIR/usr/lib/milaidy/" 2>/dev/null || true
+            cp milaidy.mjs "$PKGDIR/usr/lib/milaidy/"
+            cp package.json "$PKGDIR/usr/lib/milaidy/"
+            cp plugins.json "$PKGDIR/usr/lib/milaidy/" 2>/dev/null || true
+
+            # Install production node_modules
+            cd "$PKGDIR/usr/lib/milaidy"
+            cp "$BUILDDIR/package/package.json" .
+            npm install --production --ignore-scripts 2>/dev/null || true
+
+            # Create wrapper script
+            cat > "$PKGDIR/usr/bin/milaidy" << 'WRAPPER'
+#!/bin/sh
+exec /usr/bin/node /usr/lib/milaidy/milaidy.mjs "$@"
+WRAPPER
+            chmod +x "$PKGDIR/usr/bin/milaidy"
+
+            # Create DEBIAN/control
+            INSTALLED_SIZE=$(du -sk "$PKGDIR" | cut -f1)
+            cat > "$PKGDIR/DEBIAN/control" << DEBCTL
+Package: milaidy
+Version: ${DEB_VERSION}
+Architecture: all
+Maintainer: milady-ai <dev@milady.ai>
+Depends: nodejs (>= 22.0.0)
+Installed-Size: ${INSTALLED_SIZE}
+Homepage: https://milady.ai
+Description: Personal AI assistant built on ElizaOS
+ Milaidy is a personal AI assistant you run on your own devices,
+ built on ElizaOS. Features zero-config onboarding, multi-provider
+ AI support, web dashboard, and plugin system.
+DEBCTL
+
+            # Create DEBIAN/postinst
+            cat > "$PKGDIR/DEBIAN/postinst" << 'POSTINST'
+#!/bin/sh
+set -e
+echo ""
+echo "  Milaidy installed! Get started:"
+echo "    milaidy start       - Start the agent runtime"
+echo "    milaidy setup       - Initialize workspace"
+echo "    milaidy --help      - Show all commands"
+echo ""
+POSTINST
+            chmod +x "$PKGDIR/DEBIAN/postinst"
+
+            # Build the .deb
+            dpkg-deb --build "$PKGDIR"
+            cp "$PKGDIR.deb" "$GITHUB_WORKSPACE/pool/main/m/milaidy/"
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          echo "Built/downloaded .deb:"
+          ls -lh pool/main/m/milaidy/
+
+      - name: Generate repository metadata
+        run: |
+          # Generate Packages index
+          mkdir -p dists/stable/main/binary-amd64
+          mkdir -p dists/stable/main/binary-arm64
+          mkdir -p dists/stable/main/binary-all
+
+          dpkg-scanpackages pool/ /dev/null > dists/stable/main/binary-amd64/Packages
+          cp dists/stable/main/binary-amd64/Packages dists/stable/main/binary-arm64/Packages
+          cp dists/stable/main/binary-amd64/Packages dists/stable/main/binary-all/Packages
+
+          gzip -9c dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
+          gzip -9c dists/stable/main/binary-arm64/Packages > dists/stable/main/binary-arm64/Packages.gz
+          gzip -9c dists/stable/main/binary-all/Packages > dists/stable/main/binary-all/Packages.gz
+
+          # Generate Release file
+          cd dists/stable
+          cat > Release << RELEASE
+Origin: milady-ai
+Label: Milaidy
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64 all
+Components: main
+Description: APT repository for Milaidy — personal AI assistant
+RELEASE
+
+          # Add checksums
+          apt-ftparchive release . >> Release
+
+      - name: Import GPG key and sign
+        if: env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d/ -f2)
+
+          cd dists/stable
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --armor --detach-sign -u "$GPG_KEY_ID" -o Release.gpg Release
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --armor --clearsign -u "$GPG_KEY_ID" -o InRelease Release
+
+          # Export public key
+          gpg --armor --export "$GPG_KEY_ID" > "$GITHUB_WORKSPACE/gpg.key"
+
+      - name: Create unsigned Release (fallback)
+        if: env.GPG_PRIVATE_KEY == ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          echo "WARNING: No GPG key configured — repository will be unsigned"
+          echo "Users will need to use [trusted=yes] in their sources.list"
+
+      - name: Update index page
+        run: |
+          cat > index.html << 'INDEXHTML'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Milaidy APT Repository</title></head>
+          <body>
+          <h1>Milaidy APT Repository</h1>
+          <p>Personal AI assistant built on <a href="https://github.com/elizaos">ElizaOS</a>.</p>
+          <h2>Quick Install</h2>
+          <pre>
+# Add the repository
+curl -fsSL https://milady-ai.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/milaidy.gpg
+echo "deb [signed-by=/usr/share/keyrings/milaidy.gpg] https://milady-ai.github.io/apt stable main" | \
+  sudo tee /etc/apt/sources.list.d/milaidy.list
+
+# Install
+sudo apt update
+sudo apt install milaidy
+          </pre>
+          <h2>Links</h2>
+          <ul>
+            <li><a href="https://github.com/milady-ai/milaidy">GitHub</a></li>
+            <li><a href="https://milady.ai">milady.ai</a></li>
+            <li><a href="https://docs.milady.ai">Documentation</a></li>
+          </ul>
+          </body>
+          </html>
+INDEXHTML
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update repository: milaidy ${{ steps.ver.outputs.deb_version }}"
+          git push
