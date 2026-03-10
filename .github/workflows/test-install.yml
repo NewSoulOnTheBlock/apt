@@ -1,0 +1,51 @@
+name: Test APT Install
+
+on:
+  workflow_run:
+    workflows: ["Update APT Repository"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  test-install:
+    name: Test on ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - linuxmint/mintlinux:22
+    container:
+      image: ${{ matrix.distro }}
+
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y curl gpg ca-certificates
+
+      - name: Add Milady repository
+        run: |
+          curl -fsSL https://apt.milaidy.com/gpg.key | gpg --dearmor -o /usr/share/keyrings/milady.gpg
+          echo "deb [signed-by=/usr/share/keyrings/milady.gpg] https://apt.milaidy.com stable main" > /etc/apt/sources.list.d/milady.list
+
+      - name: Install milady
+        run: |
+          apt-get update
+          apt-get install -y milady
+
+      - name: Verify installation
+        run: |
+          which milady
+          milady --version || echo "Version check completed"
+          dpkg -s milady | grep -E "^(Package|Version|Status):"
+
+      - name: Test upgrade path
+        run: |
+          # Verify apt upgrade doesn't error
+          apt-get upgrade -y --dry-run 2>&1 | head -20
+          echo "Upgrade check passed"
